@@ -1,10 +1,19 @@
-import { consumerOpts, ConsumerOptsBuilder, JetStreamClient, JetStreamPublishOptions, JsMsg, Msg, NatsConnection } from 'nats';
-import { match } from 'ts-pattern';
-import { TypeOf, ZodObject } from 'zod';
-import { BrokerConfig } from '../ConfigBuilder';
-import { BaseCallbackPayload, BaseEnvelope } from '../BaseTypes';
+/* eslint-disable default-param-last */
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import {
+  consumerOpts,
+  ConsumerOptsBuilder,
+  JetStreamClient,
+  JetStreamPublishOptions,
+  JsMsg,
+  NatsConnection,
+} from 'nats';
+import {match} from 'ts-pattern';
+import {TypeOf, ZodObject} from 'zod';
+import {Span, SpanStatusCode} from '@opentelemetry/api';
+import {BrokerConfig} from '../ConfigBuilder';
+import {BaseCallbackPayload, BaseEnvelope} from '../BaseTypes';
 import BaseManager from './BaseManager';
-import { Span, SpanStatusCode } from '@opentelemetry/api';
 
 type ConsumerEnvelope<T> = BaseEnvelope & {
   data: T;
@@ -14,46 +23,70 @@ type ConsumerPayload<T> = BaseCallbackPayload<JsMsg, ConsumerEnvelope<T>> & {
   data: T;
 };
 
-type Consumer<T, C extends {}> = (data: ConsumerPayload<T> & C) => Promise<void> | void;
+type Consumer<T, C extends Record<string, unknown>> = (
+  data: ConsumerPayload<T> & C,
+) => Promise<void> | void;
 
-export type Envelopator<T> = (envelopeMaker: (data: T) => ConsumerEnvelope<T>) => ConsumerEnvelope<T>;
+export type Envelopator<T> = (
+  envelopeMaker: (data: T) => ConsumerEnvelope<T>,
+) => ConsumerEnvelope<T>;
 export type DispatchPayload<T> = ConsumerEnvelope<T> | Envelopator<T>;
 
 export type ConsumerDefinitions = Record<string, ZodObject<any>>;
 
-class ConsumerManager<C extends ConsumerDefinitions, CTX extends {} = {}> extends BaseManager<CTX> {
-  
+class ConsumerManager<
+  C extends ConsumerDefinitions,
+  CTX extends Record<string, unknown> = Record<string, unknown>,
+> extends BaseManager<CTX> {
   private jetStream: JetStreamClient;
 
   private scheduledForStop = false;
 
-  private pollings: Function[] = [];
+  private pollings: Array<() => Promise<void>> = [];
 
-  constructor(connection: NatsConnection, config: BrokerConfig, private consumers: C, context: CTX) {
+  constructor(
+    connection: NatsConnection,
+    config: BrokerConfig,
+    private consumers: C,
+    context: CTX,
+  ) {
     super(connection, config, context);
     this.jetStream = this.connection.jetstream(this.config.jetStreamOptions);
   }
 
-  async consume<K extends keyof C>(subject: K, consumer: Consumer<TypeOf<C[K]>, CTX>, batch = 20, expires = 5000, optsOverride?: (opts: ConsumerOptsBuilder) => ConsumerOptsBuilder): Promise<void> {
-    
+  async consume<K extends keyof C>(
+    subject: K,
+    consumer: Consumer<TypeOf<C[K]>, CTX>,
+    batch = 20,
+    expires = 5000,
+    optsOverride?: (opts: ConsumerOptsBuilder) => ConsumerOptsBuilder,
+  ): Promise<void> {
     const baseOptions = consumerOpts();
     baseOptions.ackExplicit();
-    baseOptions.durable(`d${this.config.queueName || this.config.name}-${subject as string}`);
+    baseOptions.durable(
+      `d${this.config.queueName || this.config.name}-${subject as string}`,
+    );
     baseOptions.queue(this.config.queueName || this.config.name);
     baseOptions.deliverAll();
     const options = optsOverride ? optsOverride(baseOptions) : baseOptions;
-    const subscription = await this.jetStream.pullSubscribe(subject as string, options);
+    const subscription = await this.jetStream.pullSubscribe(
+      subject as string,
+      options,
+    );
 
     let interval: NodeJS.Timeout | null = null;
 
     function startPolling() {
       if (interval === null) {
-        subscription.pull({ batch, expires });
-        interval = setInterval(() => subscription.pull({ batch, expires}), expires);
+        subscription.pull({batch, expires});
+        interval = setInterval(
+          () => subscription.pull({batch, expires}),
+          expires,
+        );
       }
     }
 
-    (async (sub) => {
+    (async sub => {
       for await (const message of sub) {
         // When receiving a message, stop polling to let the subscription work without overloading buffer
         // by adding new messages in
@@ -62,13 +95,23 @@ class ConsumerManager<C extends ConsumerDefinitions, CTX extends {} = {}> extend
           interval = null;
         }
 
-        this.withBasicPayload<JsMsg, ConsumerEnvelope<TypeOf<C[K]>>>(subject as string, 'consume', message, async (payload) => {
-          super.validateEnvelope(payload.envelope, { data: payload.envelope.data, schema: this.consumers[subject] }, undefined, true);
-          await consumer({
-            ...payload,
-            data: payload.envelope.data,
-          });
-        });
+        this.withBasicPayload<JsMsg, ConsumerEnvelope<TypeOf<C[K]>>>(
+          subject as string,
+          'consume',
+          message,
+          async payload => {
+            super.validateEnvelope(
+              payload.envelope,
+              {data: payload.envelope.data, schema: this.consumers[subject]},
+              undefined,
+              true,
+            );
+            await consumer({
+              ...payload,
+              data: payload.envelope.data,
+            });
+          },
+        );
       }
 
       // When done with all messages in buffer, poll back again
@@ -87,23 +130,32 @@ class ConsumerManager<C extends ConsumerDefinitions, CTX extends {} = {}> extend
     });
   }
 
-  async dispatch<K extends keyof C>(subject: K, data: DispatchPayload<TypeOf<C[K]>>, dispatchSpan?: Span, opts?: Partial<JetStreamPublishOptions>) {
+  async dispatch<K extends keyof C>(
+    subject: K,
+    data: DispatchPayload<TypeOf<C[K]>>,
+    dispatchSpan?: Span,
+    opts?: Partial<JetStreamPublishOptions>,
+  ) {
     const envelope = match(typeof data)
       .with('object', () => data as ConsumerEnvelope<TypeOf<C[K]>>)
       .with('function', () => {
         const envelopator = data as Envelopator<TypeOf<C[K]>>;
-        const envelopeMaker = (data: TypeOf<C[K]>) => ({
+        const envelopeMaker = (envelopedData: TypeOf<C[K]>) => ({
           ...super.buildBaseEnvelope(subject as string, dispatchSpan),
-          data,
+          data: envelopedData,
         });
 
         return envelopator(envelopeMaker);
-      }).run();
+      })
+      .run();
 
-    const validation = super.validateEnvelope(envelope, { data: envelope.data, schema: this.consumers[subject] });
+    const validation = super.validateEnvelope(envelope, {
+      data: envelope.data,
+      schema: this.consumers[subject],
+    });
     if (validation !== true) {
       dispatchSpan?.recordException(validation);
-      dispatchSpan?.setStatus({ code: SpanStatusCode.ERROR });
+      dispatchSpan?.setStatus({code: SpanStatusCode.ERROR});
       throw validation;
     }
 
