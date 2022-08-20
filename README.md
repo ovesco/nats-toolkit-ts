@@ -27,3 +27,22 @@ broker.subscribe('foo.bar', ({ data }) => {
 broker.publish('foo.bar', (wrap) => wrap({ message: 'hello' }));
 broker.publish('foo.bar', (wrap) => wrap(10)); // Argument of type 'number' is not assignable to parameter of type '{ message: string; }'
 ```
+
+## API
+
+The toolkit provides three different means of communicating.
+
+### Subscribers
+
+Subscriptions are based on the base Nats subscriptions, offering a simple fire and forget mechanism.
+Messages are not guaranteed to be delivered and no acknowledgement is sent back to the publisher.
+
+### Request-Replies
+
+Similar to subscriptions but the sender receives a response from the listener, similarly to a classical
+client-server architecture with a request and a response.
+
+### Consumers
+
+Consumers are based on Nats JetStreams to offer messages retention. Using this mechanism guarantees that
+messages are delivered.
