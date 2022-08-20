@@ -1,7 +1,7 @@
 import { Msg, NatsConnection, Subscription, SubscriptionOptions } from 'nats';
 import { Span, SpanStatusCode } from '@opentelemetry/api';
 import { match } from 'ts-pattern';
-import { TypeOf, z, ZodSchema, ZodType } from 'zod';
+import { TypeOf, z, ZodType } from 'zod';
 import { BrokerConfig } from '../ConfigBuilder';
 import BaseManager from './BaseManager';
 import { BaseCallbackPayload, BaseEnvelope } from '../BaseTypes';
@@ -19,10 +19,10 @@ type Subscriber<T, C extends {}> = (data: SubscribePayload<T> & C) => Promise<vo
 type Envelopator<T> = (envelopeMaker: (data: T) => SubscribeEnvelope<T>) => SubscribeEnvelope<T>;
 type SendPayload<T> = SubscribeEnvelope<T> | Envelopator<T>;
 
-export type SubscriberDefinitions = Record<string, ZodSchema>;
+export type SubscriberDefinitions = Record<string, ZodType>;
 
-type SubscriptionDefinition<Z extends ZodType> = {
-  input: Z
+export const defineSubscriptions = <S extends SubscriberDefinitions>(subs: S): S => {
+  return subs;
 };
 
 class SubscriberManager<S extends SubscriberDefinitions, C extends {} = {}> extends BaseManager<C> {
@@ -30,8 +30,6 @@ class SubscriberManager<S extends SubscriberDefinitions, C extends {} = {}> exte
   constructor(connection: NatsConnection, config: BrokerConfig, private subscriptions: S, context: C) {
     super(connection, config, context);
   }
-
-  async sub()
 
   async subscribe<K extends keyof S>(subject: K, subscriber: Subscriber<TypeOf<S[K]>, C>, opts?: SubscriptionOptions): Promise<Subscription> {
     const sub = this.connection.subscribe(subject as string, {

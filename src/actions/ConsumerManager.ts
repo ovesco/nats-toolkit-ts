@@ -1,17 +1,23 @@
 import { consumerOpts, ConsumerOptsBuilder, JetStreamClient, JetStreamPublishOptions, JsMsg, Msg, NatsConnection } from 'nats';
-import { Span } from 'opentracing';
 import { match } from 'ts-pattern';
 import { TypeOf, ZodObject } from 'zod';
 import { BrokerConfig } from '../ConfigBuilder';
-import { Envelope } from '../Messaging';
-import { BasePayload } from '../Messaging';
+import { BaseCallbackPayload, BaseEnvelope } from '../BaseTypes';
 import BaseManager from './BaseManager';
+import { Span, SpanStatusCode } from '@opentelemetry/api';
 
-export type ConsumerPayload<T> = BasePayload<T, JsMsg>;
+type ConsumerEnvelope<T> = BaseEnvelope & {
+  data: T;
+};
+
+type ConsumerPayload<T> = BaseCallbackPayload<JsMsg, ConsumerEnvelope<T>> & {
+  data: T;
+};
+
 type Consumer<T, C extends {}> = (data: ConsumerPayload<T> & C) => Promise<void> | void;
 
-export type Envelopator<T> = (envelopeMaker: (data: T) => Envelope<T>) => Envelope<T>;
-export type DispatchPayload<T> = Envelope<T> | Envelopator<T>;
+export type Envelopator<T> = (envelopeMaker: (data: T) => ConsumerEnvelope<T>) => ConsumerEnvelope<T>;
+export type DispatchPayload<T> = ConsumerEnvelope<T> | Envelopator<T>;
 
 export type ConsumerDefinitions = Record<string, ZodObject<any>>;
 
@@ -56,21 +62,13 @@ class ConsumerManager<C extends ConsumerDefinitions, CTX extends {} = {}> extend
           interval = null;
         }
 
-        const payload = super.buildBasicPayload<TypeOf<C[K]>, JsMsg>(subject, message);
-        const validation = super.validateEnvelope(payload.envelope, ['data', this.consumers[subject]]);
-        if (validation !== true) {
-          payload.span.logEvent('validation-error', { error: validation });
-          payload.span.finish();
-          return;
-        }
-
-        try {
-          consumer(payload);
-        } catch (error) {
-          payload.span.logEvent('consumer-error', { error });
-        } finally {
-          payload.span.finish();
-        }
+        this.withBasicPayload<JsMsg, ConsumerEnvelope<TypeOf<C[K]>>>(subject as string, 'consume', message, async (payload) => {
+          super.validateEnvelope(payload.envelope, { data: payload.envelope.data, schema: this.consumers[subject] }, undefined, true);
+          await consumer({
+            ...payload,
+            data: payload.envelope.data,
+          });
+        });
       }
 
       // When done with all messages in buffer, poll back again
@@ -90,28 +88,27 @@ class ConsumerManager<C extends ConsumerDefinitions, CTX extends {} = {}> extend
   }
 
   async dispatch<K extends keyof C>(subject: K, data: DispatchPayload<TypeOf<C[K]>>, dispatchSpan?: Span, opts?: Partial<JetStreamPublishOptions>) {
-    const span = super.buildSpan(subject as string, 'dispatch', dispatchSpan);
     const envelope = match(typeof data)
-      .with('object', () => data as Envelope<TypeOf<C[K]>>)
+      .with('object', () => data as ConsumerEnvelope<TypeOf<C[K]>>)
       .with('function', () => {
         const envelopator = data as Envelopator<TypeOf<C[K]>>;
         const envelopeMaker = (data: TypeOf<C[K]>) => ({
-          ...super.buildBaseEnvelope(subject as string),
+          ...super.buildBaseEnvelope(subject as string, dispatchSpan),
           data,
         });
 
         return envelopator(envelopeMaker);
       }).run();
 
-    const validation = super.validateEnvelope(envelope, ['data', this.consumers[subject]]);
+    const validation = super.validateEnvelope(envelope, { data: envelope.data, schema: this.consumers[subject] });
     if (validation !== true) {
+      dispatchSpan?.recordException(validation);
+      dispatchSpan?.setStatus({ code: SpanStatusCode.ERROR });
       throw validation;
     }
 
-    const headers = super.buildMessageHeaders(span);
     const payload = this.config.serializer(envelope);
-    this.jetStream.publish(subject as string, payload, { headers, ...opts });
-    span.finish();
+    this.jetStream.publish(subject as string, payload, opts);
   }
 }
 

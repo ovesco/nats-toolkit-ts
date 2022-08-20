@@ -1,12 +1,11 @@
 import { JsMsg, Msg } from "nats";
-import { Span, Tracer } from "opentracing";
+import { Span, SpanContext, Tracer } from "@opentelemetry/api";
 import { Logger } from "pino";
 import { z } from "zod";
 
-export type BasePayload<T, M extends Msg | JsMsg> = {
+export type BaseCallbackPayload<M extends Msg | JsMsg, E extends BaseEnvelope> = {
   message: M,
-  envelope: Envelope<T>,
-  data: T,
+  envelope: E,
   span: Span,
   tracer: Tracer,
   logger: Logger,
@@ -18,10 +17,7 @@ export type BaseEnvelope = {
   subject: string;
   service: string;
   instance: string | number;
-}
-
-export type Envelope<T> = BaseEnvelope & {
-  data: T;
+  spanContext?: SpanContext;
 }
 
 export const BaseEnvelopeSchema = z.object({
@@ -29,8 +25,4 @@ export const BaseEnvelopeSchema = z.object({
   subject: z.string(),
   service: z.string(),
   instance: z.union([z.string(), z.number()]),
-});
-
-export const EnvelopeSchema = BaseEnvelopeSchema.extend({
-  data: z.any(),
 });

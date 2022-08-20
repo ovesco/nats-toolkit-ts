@@ -1,100 +1,94 @@
 import { headers, JsMsg, Msg, NatsConnection } from 'nats';
-import { FORMAT_HTTP_HEADERS, Span } from 'opentracing';
+import { Link, Span, SpanContext, SpanStatusCode } from '@opentelemetry/api';
 import { v4 } from 'uuid';
-import { ZodSchema } from 'zod';
+import { z, ZodSchema } from 'zod';
 import { BrokerConfig } from '../ConfigBuilder';
-import { BaseEnvelope, BaseEnvelopeSchema, Envelope } from '../Messaging';
-import { BasePayload } from '../Messaging';
+import { BaseEnvelope, BaseEnvelopeSchema } from '../BaseTypes';
+import { BaseCallbackPayload } from '../BaseTypes';
 
-export type ValidationChainElement<T> = [keyof T | undefined, ZodSchema];
+export type PropValidation = { data: any, schema: ZodSchema };
 
 abstract class BaseManager<C extends {} = {}> {
   
   constructor(protected connection: NatsConnection, protected config: BrokerConfig, protected context: C) {
   }
 
-  protected buildBasicPayload<T, M extends Msg | JsMsg>(subject: string | number | symbol, message: M): BasePayload<T, M> & C {
-    const envelope = this.config.deserializer<Envelope<T>>(message.data);
-    return {
-      message,
-      envelope,
-      data: envelope.data,
-      tracer: this.config.tracer,
-      logger: this.config.logger,
-      span: this.extractSpan(subject as string, message),
-      ...this.context,
-    };
-  }
-
-  protected validateEnvelope<T extends BaseEnvelope>(data: T, subProp?: ValidationChainElement<T>) {
-    const subSchemas: ValidationChainElement<T>[] = [
-      [undefined, BaseEnvelopeSchema],
-    ];
+  protected validateEnvelope<T extends BaseEnvelope>(envelope: T, subProp?: PropValidation, customEnvelopeSchema: z.ZodObject<any> = BaseEnvelopeSchema, throwException = false) {
+    const subSchemas: PropValidation[] = [{ data: envelope, schema: customEnvelopeSchema }];
 
     if (subProp) {
       subSchemas.push(subProp);
     }
 
-    for (const [accessor, schema] of subSchemas) {
-      const prop = accessor ? data[accessor] : data;
-      const validation = schema.safeParse(prop);
+    for (const { data, schema } of subSchemas) {
+      const validation = schema.safeParse(data);
       if (!validation.success) {
-        return validation.error;
+        if (throwException) {
+          throw validation.error;
+        } else {
+          return validation.error;
+        }
       }
     }
 
     return true;
   }
 
-  protected buildBaseEnvelope(subject: string): BaseEnvelope {
+  protected withSpan(subject: string, action: string, parentSpanContext: SpanContext | undefined, callback: (span: Span) => Promise<void>) {
+    const links: Link[] = [];
+    if (parentSpanContext) {
+      links.push({ context: parentSpanContext });
+    }
+
+    return new Promise((resolve, reject) => {
+      this.config.tracer.startActiveSpan(subject, {
+        links,
+        attributes: {
+          action,
+          service: this.config.name,
+          instance: this.config.id,
+        },
+      }, (span) => {
+        callback(span)
+          .then(() => {
+            span.end();
+            resolve(undefined);
+          }).catch((error) => {
+            span.recordException(error);
+            span.setStatus({
+              code: SpanStatusCode.ERROR,
+            });
+            span.end();
+            reject(error);
+          });
+      });
+    });
+  }
+
+  protected withBasicPayload<M extends Msg | JsMsg, E extends BaseEnvelope>(subject: string, action: string, message: M, callback: (payload: BaseCallbackPayload<M, E> & C) => Promise<void>) {
+    const envelope = this.config.deserializer<E>(message.data);
+    return this.withSpan(subject, action, envelope.spanContext, async (span) => {
+      const basePayload = {
+        message,
+        envelope,
+        span,
+        tracer: this.config.tracer,
+        logger: this.config.logger,
+        ...this.context,
+      };
+      await callback(basePayload);
+    });
+  }
+
+  protected buildBaseEnvelope(subject: string, parentSpan?: Span): BaseEnvelope {
     return {
       id: v4(),
       subject,
       date: Date.now(),
       service: this.config.name,
       instance: this.config.id,
+      spanContext: parentSpan?.spanContext(),
     };
-  }
-
-  protected buildSpan(title: string, action: string, parentSpan?: Span) {
-    return this.config.tracer.startSpan(title, {
-      childOf: parentSpan,
-      tags: {
-        action,
-        service: this.config.name,
-        instance: this.config.id,
-      },
-    });
-  }
-  
-  protected extractSpan(title: string, message: Msg | JsMsg) {
-    const headers: Record<string, string> = {};
-    if (message.headers) {
-      for (const [key, value] of message.headers) {
-        headers[key] = Array.isArray(value) ? value[0] : value as string;
-      }
-    }
-  
-    const span = this.config.tracer.startSpan(title, {
-      childOf: this.config.tracer.extract(FORMAT_HTTP_HEADERS, headers) || undefined,
-      tags: {
-        service: this.config.name,
-        instance: this.config.id,
-      }
-    });
-  
-    return span;
-  };
-  
-  protected buildMessageHeaders(span: Span) {
-    const h = headers();
-    const context: Record<string, string> = {};
-    this.config.tracer.inject(span.context(), FORMAT_HTTP_HEADERS, context);
-    for (const [key, value] of Object.entries(context)) {
-      h.append(key, value);
-    }
-  
-    return h;
   }
 }
 

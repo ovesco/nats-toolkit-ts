@@ -25,6 +25,7 @@ CTX extends {} = {}>(types: TypesConfig<SUB, REP, CON>, config?: SetupConfig, co
 
   return {
     connection,
+    config: brokerConfig,
 
     publish: subscriberManager.publish.bind(subscriberManager),
     subscribe: subscriberManager.subscribe.bind(subscriberManager),

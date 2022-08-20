@@ -1,11 +1,11 @@
-import { Msg, NatsConnection, RequestOptions, SubscriptionOptions } from 'nats';
-import { Span } from 'opentracing';
+import { Msg, NatsConnection, RequestOptions, Subscription, SubscriptionOptions } from 'nats';
+import { Span, SpanStatusCode } from '@opentelemetry/api';
 import { match } from 'ts-pattern';
-import { TypeOf, z, ZodError, ZodObject } from 'zod';
+import { TypeOf, z, ZodError, ZodSchema } from 'zod';
 import { BrokerConfig } from '../ConfigBuilder';
-import { BaseEnvelope, BaseEnvelopeSchema } from '../Messaging';
-import { BasePayload } from '../Messaging';
-import BaseManager, { ValidationChainElement } from './BaseManager';
+import { BaseEnvelope, BaseEnvelopeSchema } from '../BaseTypes';
+import { BaseCallbackPayload } from '../BaseTypes';
+import BaseManager, { PropValidation } from './BaseManager';
 
 /* Request Types */
 type RequestEnvelope<T> = BaseEnvelope & {
@@ -16,9 +16,9 @@ export type RequestEnvelopator<T> = (envelopeMaker: (data: T) => RequestEnvelope
 type RequestMethodData<T> = RequestEnvelope<T> | RequestEnvelopator<T>;
 
 /* Reply Types */
-type ErrorPayload<E, K extends keyof E> = {
+type ReplyErrorPayload<E, K extends keyof E> = {
   code: K,
-  data?: E[K],
+  data?: E[K] extends ZodSchema ? TypeOf<E[K]> : E[K],
 } | {
   code: 'PAYLOAD_VALIDATION',
   data: ZodError,
@@ -31,19 +31,24 @@ interface ReplyEnvelope extends BaseEnvelope {
   type: 'success' | 'error',
 }
 
-interface ErrorEnvelope<E, K extends keyof E> extends ReplyEnvelope {
+export interface ReplyErrorEnvelope<E, K extends keyof E> extends ReplyEnvelope {
   type: 'error',
-  error: ErrorPayload<E, K>,
+  error: ReplyErrorPayload<E, K>,
 }
 
-interface DataEnvelope<T> extends ReplyEnvelope {
+export interface ReplyDataEnvelope<T> extends ReplyEnvelope {
+  type: 'success',
   data: T,
 }
 
+export type ReplyAllTypesEnvelope<T, E> = ReplyEnvelope & (ReplyErrorEnvelope<E, keyof E> | ReplyDataEnvelope<T>);
+
 const ErrorEnvelopeSchema = BaseEnvelopeSchema.extend({
   type: z.literal('error'),
-  code: z.union([z.string(), z.number()]),
-  data: z.any().optional(),
+  error: z.object({
+    code: z.union([z.string(), z.number()]),
+    data: z.any().optional(),
+  }),
 });
 
 const DataEnvelopeSchema = BaseEnvelopeSchema.extend({
@@ -51,28 +56,24 @@ const DataEnvelopeSchema = BaseEnvelopeSchema.extend({
   data: z.any().optional(),
 });
 
-export type ReplyErrorPayload<E, K extends keyof E> = {
-  code: K,
-  data?: E[K],
-};
-
-type ErrorEnvelopator<ERR> = <K extends keyof ERR>(envelopeMaker: (data: ErrorPayload<ERR, K>) => ErrorEnvelope<ERR, K>) => ErrorEnvelope<ERR, K>;
-type ReplyEnvelopator<T> = (envelopeMaker: (data: T) => DataEnvelope<T>) => DataEnvelope<T>;
+type ReplyErrorEnvelopator<ERR, K extends keyof ERR> = (envelopeMaker: (data: ReplyErrorPayload<ERR, K>) => ReplyErrorEnvelope<ERR, K>) => ReplyErrorEnvelope<ERR, K>;
+type ReplyDataEnvelopator<T> = (envelopeMaker: (data: T) => ReplyDataEnvelope<T>) => ReplyDataEnvelope<T>;
 
 interface ReplierDefinition {
-  request: ZodObject<any>;
-  reply: ZodObject<any>;
-  errors: Record<string, any>;
+  request: ZodSchema;
+  reply: ZodSchema;
+  errors?: Record<string, any>;
 };
 
 export type ReplierDefinitions = Record<string, ReplierDefinition>;
 
-type DataReplier<T> =  (data: DataEnvelope<T> | ReplyEnvelopator<T>) => void;
-type ErrorReplier<ERR> = <K extends keyof ERR>(data: ErrorEnvelope<ERR, K> | ErrorEnvelopator<ERR>) => void;
+type DataReplier<T> =  (data: ReplyDataEnvelope<T> | ReplyDataEnvelopator<T>) => void;
+type ErrorReplier<ERR> = <K extends keyof ERR>(data: ReplyErrorEnvelope<ERR, K> | ReplyErrorEnvelopator<ERR, K>) => void;
 
-interface ReplyPayload<REQ, REP, ERR> extends BasePayload<REQ, Msg> {
-  reply: DataReplier<REP>;
-  error: ErrorReplier<ERR>;
+interface ReplyPayload<REQ, REP, ERR> extends BaseCallbackPayload<Msg, RequestEnvelope<REQ>> {
+  data: REQ;
+  replyWithData: DataReplier<REP>;
+  replyWithError: ErrorReplier<ERR>;
 }
 
 export type Replier<RDS extends ReplierDefinitions, K extends keyof RDS, C extends {}> = (data: ReplyPayload<TypeOf<RDS[K]['request']>, TypeOf<RDS[K]['reply']>, RDS[K]['errors']> & C) => Promise<void> | void;
@@ -83,84 +84,81 @@ class ReplierManager<R extends ReplierDefinitions, C extends {} = {}> extends Ba
     super(connection, config, context);
   }
 
-  async reply<K extends keyof R>(subject: K, subscriber: Replier<R, K, C>, opts?: SubscriptionOptions): Promise<void> {
-    const subscription = this.connection.subscribe(subject as string, {
+  reply<K extends keyof R>(subject: K, subscriber: Replier<R, K, C>, opts?: SubscriptionOptions): Subscription {
+    const sub = this.connection.subscribe(subject as string, {
       queue: `${this.config.queueName}-${subject as string}`,
       ...opts,
     });
-    for await (const message of subscription) {
-      const basicPayload = super.buildBasicPayload<TypeOf<R[K]['request']>, Msg>(subject, message);
-      const replySubject = message.reply;
-      if (!replySubject) {
-        // No reply subject, abort
-        basicPayload.span.log({ event: 'no-reply-subject'});
-        basicPayload.span.finish();
-        return;
+    (async (subscription) => {
+      for await (const message of subscription) {
+        this.withBasicPayload<Msg, RequestEnvelope<TypeOf<R[K]['request']>>>(subject as string, 'reply', message, async (payload) => {
+          const replySubject = message.reply;
+          if (!replySubject) {
+            payload.span.addEvent('Missing reply subject');
+            return;
+          }
+  
+          const send = <T extends BaseEnvelope>(envelope: T, validationChain?: PropValidation, customEnvelopeSchema?: z.ZodObject<any>) => {
+            const validation = super.validateEnvelope(envelope, validationChain, customEnvelopeSchema);
+  
+            // Reply payload validation failed, notify client of internal error and end span
+            if (validation !== true) {
+              replyWithError((builder) => builder({ code: 'INTERNAL_ERROR', data: validation }));
+              throw validation;
+            }
+  
+            this.connection.publish(replySubject, this.config.serializer(envelope));
+          }
+  
+          const replyWithError: ErrorReplier<R[K]['errors']> = (data) => {
+            const envelope = match(typeof data)
+              .with('object', () => data as ReplyErrorEnvelope<R[K]['errors'], keyof R[K]['errors']>)
+              .with('function', () => {
+                const envelopator = data as ReplyErrorEnvelopator<R[K]['errors'], any>;
+                return envelopator((err) => this.buildErrorEnvelope(subject as string, err));
+              }).run();
+  
+            const validationChain = this.getErrorValidationChain(subject, envelope.error);
+            send(envelope, validationChain, ErrorEnvelopeSchema);
+          };
+  
+          const replyWithData: DataReplier<TypeOf<R[K]['reply']>> = (data) => {
+            const envelope = match(typeof data)
+              .with('object', () => data as ReplyDataEnvelope<TypeOf<R[K]['reply']>>)
+              .with('function', () => {
+                const envelopator = data as ReplyDataEnvelopator<TypeOf<R[K]['reply']>>;
+                return envelopator((data) => this.buildDataEnvelope(subject as string, data));
+              }).run();
+              send(envelope, { data: envelope.data, schema: this.repliers[subject].reply }, DataEnvelopeSchema);
+            }
+  
+          // Failed validation, reply with error and finish
+          const requestValidation = super.validateEnvelope(payload.envelope, { data: payload.envelope.data, schema: this.repliers[subject].request });
+          if (requestValidation !== true) {
+            replyWithError((builder) => builder({ code: 'PAYLOAD_VALIDATION', data: requestValidation }));
+            throw requestValidation;
+          }
+
+          const resPayload = {
+            ...payload,
+            data: payload.envelope.data,
+            replyWithData,
+            replyWithError,
+          };
+
+          try {
+            await subscriber(resPayload);
+          } catch (error: any) {
+            replyWithError((b) => b({ code: 'INTERNAL_ERROR', data: error }));
+            throw error;
+          }
+        });
       }
-
-      const send = <T extends BaseEnvelope>(envelope: T, validationChain: ValidationChainElement<T>) => {
-        const validation = super.validateEnvelope(envelope, validationChain);
-
-        // Reply payload validation failed, notify client of internal error and end span
-        if (!validation) {
-          basicPayload.span.logEvent('reply-schema', { payload: 'reply' });
-          replyError((builder) => builder({ code: 'INTERNAL_ERROR', data: validation }));
-          basicPayload.span.finish();
-          throw validation;
-        }
-
-        this.connection.publish(replySubject, this.config.serializer(envelope));
-        basicPayload.span.finish();
-      }
-
-      const replyError: ErrorReplier<R[K]['errors']> = (data) => {
-        const envelope = match(typeof data)
-          .with('object', () => data as ErrorEnvelope<R[K]['errors'], keyof R[K]['errors']>)
-          .with('function', () => {
-            const envelopator = data as ErrorEnvelopator<R[K]['errors']>;
-            return envelopator((err) => this.buildErrorEnvelope(subject as string, err));
-          }).run();
-        send(envelope, ['error', ErrorEnvelopeSchema]);
-      };
-
-      const replyData: DataReplier<TypeOf<R[K]['reply']>> = (data) => {
-        const envelope = match(typeof data)
-          .with('object', () => data as DataEnvelope<TypeOf<R[K]['reply']>>)
-          .with('function', () => {
-            const envelopator = data as ReplyEnvelopator<TypeOf<R[K]['reply']>>;
-            return envelopator((data) => this.buildDataEnvelope(subject as string, data));
-          }).run();
-          send(envelope, ['data', DataEnvelopeSchema]);
-        }
-
-      // Failed validation, reply with error and finish
-      const requestValidation = super.validateEnvelope(basicPayload.envelope, ['data', this.repliers[subject].request]);
-      if (requestValidation !== true) {
-        basicPayload.span.logEvent('validation-error', { error: requestValidation });
-        replyError((builder) => builder({ code: 'PAYLOAD_VALIDATION', data: requestValidation }));
-        basicPayload.span.finish();
-        return;
-      }
-
-      // Proceed with callback
-      try {
-        const payload = {
-          ...basicPayload,
-          reply: replyData,
-          error: replyError,
-        };
-
-        subscriber(payload);
-      } catch (error) {
-        basicPayload.span.logEvent('subscriber-error', { error });
-      } finally {
-        basicPayload.span.finish();
-      }
-    }
+    })(sub);
+    return sub;
   }
 
   async request<K extends keyof R, REQ = TypeOf<R[K]['request']>>(subject: K, data: RequestMethodData<REQ>, requestSpan?: Span, opts?: RequestOptions) {
-    const span = this.buildSpan(subject as string, 'request', requestSpan);
     const envelope = match(typeof data)
       .with('object', () => data as RequestEnvelope<REQ>)
       .with('function', () => {
@@ -173,18 +171,44 @@ class ReplierManager<R extends ReplierDefinitions, C extends {} = {}> extends Ba
         return envelopator(envelopeMaker);
       }).run();
 
-    const validation = super.validateEnvelope(envelope, ['data', this.repliers[subject]['request']]);
+    const validation = super.validateEnvelope(envelope, { data: envelope.data, schema: this.repliers[subject].request });
     if (validation !== true) {
+      requestSpan?.recordException(validation);
+      requestSpan?.setStatus({ code: SpanStatusCode.ERROR });
       throw validation;
     }
 
-    const headers = super.buildMessageHeaders(span);
     const payload = this.config.serializer(envelope);
-    this.connection.request(subject as string, payload, { headers, timeout: 1000, ...opts });
-    span.finish();
+    const resMsg = await this.connection.request(subject as string, payload, { timeout: 1000, ...opts });
+    const resData = this.config.deserializer<ReplyAllTypesEnvelope<TypeOf<R[K]['reply']>, R[K]['errors']>>(resMsg.data);
+    let resValidation: true | ZodError<any> = true;
+    if (resData.type === 'success') {
+      resValidation = super.validateEnvelope(resData, { data: resData.data, schema: this.repliers[subject].reply }, DataEnvelopeSchema);
+    } else {
+      const replyValidationChain = this.getErrorValidationChain(subject, resData.error);
+      resValidation = super.validateEnvelope(resData, replyValidationChain, ErrorEnvelopeSchema);
+    }
+
+    if (resValidation !== true) {
+      // Reply payload is not of expected shape, reject
+      requestSpan?.recordException(resValidation);
+      requestSpan?.setStatus({ code: SpanStatusCode.ERROR });
+      throw resValidation;
+    }
+
+    return resData;
   }
 
-  private buildErrorEnvelope<ERR, K extends keyof ERR>(subject: string, error: ErrorPayload<ERR, K>): ErrorEnvelope<ERR, K> {
+  private getErrorValidationChain<S extends keyof R>(subject: S, error: ReplyErrorPayload<any, any>): PropValidation | undefined {
+    const { errors } = this.repliers[subject];
+    if (errors && (error.code in errors) && ('safeParse' in errors[error.code])) {
+      return { data: error.data, schema: errors[error.code] };
+    }
+
+    return undefined;
+  }
+
+  private buildErrorEnvelope<ERR, K extends keyof ERR>(subject: string, error: ReplyErrorPayload<ERR, K>): ReplyErrorEnvelope<ERR, K> {
     return {
       ...super.buildBaseEnvelope(subject),
       type: 'error',
@@ -192,7 +216,7 @@ class ReplierManager<R extends ReplierDefinitions, C extends {} = {}> extends Ba
     };
   }
 
-  private buildDataEnvelope<T>(subject: string, data: T): DataEnvelope<T> {
+  private buildDataEnvelope<T>(subject: string, data: T): ReplyDataEnvelope<T> {
     return {
       ...super.buildBaseEnvelope(subject),
       type: 'success',

@@ -1,5 +1,5 @@
+import opentelemetry, { Tracer } from "@opentelemetry/api";
 import { ConnectionOptions, JetStreamOptions, StringCodec } from "nats";
-import { Tracer } from "opentracing";
 import pino, { Logger } from "pino";
 import { v4 as uuid } from 'uuid';
 
@@ -23,7 +23,7 @@ export const buildConfig = (config: SetupConfig): BrokerConfig => {
   const serializer = config.serializer ?? ((payload) => codec.encode(JSON.stringify(payload)));
   const deserializer = config.deserializer ?? ((payload) => JSON.parse(codec.decode(payload)));
   const name = config.name || uuid();
-  const tracer = config.tracer || new Tracer();
+  const tracer = config.tracer || opentelemetry.trace.getTracer(name);
   const logger = config.logger || pino();
 
   return {
